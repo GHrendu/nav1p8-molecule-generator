@@ -23,6 +23,54 @@ python -m pip install -e ".[dev]"
 
 上面安装命令中的 `python` 须指向新环境，也可先激活环境。REACTION 示例无需 GPU、联网或模型权重。所有配置中的文件路径均**相对于配置文件所在目录**，CLI 的 `--output` 相对于当前工作目录。已有非空输出目录会拒绝覆盖，请使用新批次目录。
 
+## 这一版相较上一版的改动
+
+上一版主要是候选生成与二维筛选的工程原型；这一版补上了真实结构输入、种子类似物生成和双亚型 docking。重要的是，**不只是多接了一个 docking 命令，也修正了上一版生成逻辑没有真正沿用所记录 seed 的问题**。
+
+| 内容 | 上一版 | 当前版本 |
+|---|---|---|
+| 种子与候选结构 | 输出记录里有 seed，但生成结构实际固定为简单苯甲酰苯胺系列，和 A-803467 骨架不一致 | `configs/a803467_site_c.json` 指定 A-803467；局部枚举芳基氯及甲氧基改造，并保留其核心骨架 |
+| 靶点证据 | 以二维性质/代理评分为主，没有候选级真实受体 docking 排名 | 对候选进行三维受体 docking；当前流程将同一配体集分别对接 Nav1.8 和 Nav1.5 |
+| Nav1.5 | 未接入 Nav1.5 对照 receptor 流程 | 新增 6LQA 链 B 清理脚本和以共晶 quinidine 为中心的 docking box |
+| ligand 输入 | 2D 分子输入容易造成不合适的 docking 初始构象 | ETKDG 生成 3D 构象，MMFF/UFF 优化，Meeko 转为 Vina 使用的 PDBQT |
+| 运行与记录 | 结果容易混在固定输出位置 | 每轮写入新的时间戳目录，保存 config 快照、评分表、PDBQT 和 pose，不覆盖先前批次 |
+
+### 复现当前 A-803467 / Nav1.8 / Nav1.5 流程
+
+先生成候选：
+
+```powershell
+python -m navgen generate --config configs/a803467_site_c.json --output outputs/a803467_nav18_nav15_round1
+```
+
+准备 Nav1.5 receptor（原始结构文件不会被修改）：
+
+```powershell
+python scripts/clean_nav15_chain_b.py
+& "$HOME\miniconda3\envs\vina_clean\python.exe" -m meeko.cli.mk_prepare_receptor `
+  --read_pdb outputs/nav15_chainB_6LQA_clean.pdb `
+  --write_pdbqt outputs/nav15_chainB_6LQA.pdbqt `
+  --default_altloc A `
+  --box_center 128.691875 125.578875 137.582083 `
+  --box_size 24 24 24
+```
+
+再对同一批候选进行双受体 docking：
+
+```powershell
+python scripts/batch_dock_generated_candidates.py --config configs/docking_a803467_nav18_nav15.json
+```
+
+当前已验证的一轮结果位于 `outputs/a803467_nav18_nav15_round1/docking_runs/20260926_174205/`，共 8 个分子（7 个通过过滤的类似物 + A-803467 参考分子），Nav1.8 与 Nav1.5 各 8/8 成功。结果 CSV 为 `candidate_docking.csv`。`outputs/` 被 Git 忽略，所以**结果文件不会随代码提交上传**；队友运行以上流程可在本地重新生成。仓库包含原始结构、清理脚本、配置和程序代码。
+
+### 结果应如何理解
+
+- 本轮是基于 A-803467 的小范围、可解释局部结构枚举，不是大规模生成模型或已经训练好的 REINVENT4 活性模型。
+- 生成批次关闭了示例蛋白序列评分；候选生成仍使用二维理化性质过滤和 Site C 结构规则代理。
+- 当前 Vina affinity 只是计算打分。本轮结果没有证明 Nav1.8 选择性：某些分子在 Nav1.5 上的分数也同样有利。
+- 两个亚型的 receptor 来自不同实验结构和 ligand-centered docking box；不能把两个 Vina 分数的简单差值当作实验选择性、真实结合自由能或药效。
+- 当前小批次适合验证流程和形成后续假设，不足以据此宣称发现了有效的 Nav1.8 选择性药物。
+
 ## 2. 实现范围与汇报对应
 
 | 汇报要求 | 代码 | 行为 |
