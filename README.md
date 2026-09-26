@@ -2,7 +2,7 @@
 
 依据《课题汇报_Nav1.8小分子生成算法设计.md》的第 4–9 节实现。输入孔道位点种子，输出带来源、二维性质、奖励分和可选三维构象的候选库，供 Nav1.8 / Nav1.5 下游对接和下一轮生成使用。
 
-当前可直接运行的部分是 **反应模板局部生成 → 二维过滤 → 多构象导出 → 外部评分回灌**。化学语言模型使用 **REINVENT4 Mol2Mol**，提供真实接口对应的采样/RL 配置生成器和外部奖励组件；需另备 REINVENT4 环境及 Mol2Mol 权重。本项目不含预训练权重或真实配对活性数据，不能据示例结果宣称获得有效或选择性药物。
+当前可直接运行的部分是 **反应模板局部生成 → 二维过滤 → 多构象导出 → 外部评分回灌**。化学语言模型使用 **REINVENT4 Mol2Mol**，提供官方当前 TOML 格式的采样/RL 配置生成器。官方 prior 可由 `scripts/download_reinvent_prior.ps1` 下载，REINVENT4 环境可由 `scripts/setup_reinvent4.ps1` 创建；模型和第三方源码均被 `.gitignore` 排除。本项目不含真实配对活性数据，不能据示例结果宣称获得有效或选择性药物。
 
 ## 1. 立即运行
 
@@ -86,16 +86,19 @@ SMILES 保留手性、电荷和互变异构体身份，仅规范原子排序并�
 
 接口依据 REINVENT4 提交 `ee0d56f4a07472bbb622cd0858184d06f11bff5d` 的 `configs/sampling.toml`、`configs/staged_learning.toml` 和 `comp_external_process.py` 核对。
 
-先在适配 GPU/PyTorch 的独立环境安装 [REINVENT4](https://github.com/MolecularAI/REINVENT4)，准备其可信 **Mol2Mol prior**。本模块环境只承担 RDKit/代理评分，不要求安装 PyTorch。
+先运行脚本安装适配 GPU/PyTorch 的独立环境并下载官方 **Mol2Mol prior**：
 
 ```powershell
-.\.venv\Scripts\python.exe -m navgen prepare-reinvent --config configs/demo.json --prior D:/models/mol2mol_medium_similarity.prior --output outputs/reinvent --device cuda:0 --num-smiles 1000
+.\scripts\download_reinvent_prior.ps1
+.\scripts\setup_reinvent4.ps1 -Backend cpu
+.\.venv\Scripts\python.exe -m navgen prepare-reinvent --config configs/site_c_reference.json --prior models/reinvent4/mol2mol_medium_similarity.prior --output outputs/reinvent_site_c_reference --device cpu --num-smiles 100
 ```
 
-在 REINVENT4 环境运行：
+在 REINVENT4 环境运行采样或 RL：
 
 ```bash
-reinvent /absolute/project/outputs/reinvent/sampling.toml
+conda run -n reinvent4 reinvent /absolute/project/outputs/reinvent_site_c_reference/sampling.toml
+conda run -n reinvent4 reinvent /absolute/project/outputs/reinvent_site_c_reference/staged_learning.toml
 ```
 
 然后回到本模块环境：
@@ -112,11 +115,59 @@ RL 配置在同目录的 `staged_learning.toml`：
 reinvent /absolute/project/outputs/reinvent/staged_learning.toml
 ```
 
-其 ExternalProcess 通过指定 Python 执行 `-m navgen score-stdin`，stdin 每行一个 SMILES，stdout 返回 `{"version":1,"payload":{"nav18_reward":[...]}}`，保留输入顺序和长度。`prepare-reinvent --python` 可指定独立评分环境的绝对 Python 路径，该环境须安装本项目。
+`score-stdin` 仍可对 REINVENT4 输出的 CSV/SMILES 做完整项目评分，stdin 每行一个 SMILES，stdout 返回 `{"version":1,"payload":{"nav18_reward":[...]}}`，保留输入顺序和长度。当前生成的官方 staged-learning 配置首先使用 REINVENT4 原生 QED/MW/LogP 组件验证 DAP 链路；Site C/protein-word 代理在二次评分中使用，避免伪造尚未注册的 REINVENT4 scoring component。
+
+## 7. Vina 三维 docking
+
+项目已接入真实 Vina 1.2.7 调用。单配体流程使用配置文件指定的 PDBQT 输入：
+
+```powershell
+python -m navgen.cli_docking --config configs/docking_nav18_site_c_real_cleaned.json
+```
+
+输入必须是已经按统一质子化/电荷规则准备好的 PDBQT。结果写入配置指定的新目录，
+包括每个 ligand 的 pose、返回码、最佳 Vina affinity 和 `docking_results.json`。
+
+以 A-803467 为种子生成 seed-local 类似物，并对 Nav1.8/Nav1.5 做同批 docking：
+
+```powershell
+python -m navgen generate --config configs/a803467_site_c.json --output outputs/a803467_site_c_round1
+python scripts/clean_nav15_chain_b.py
+& "$HOME\miniconda3\envs\vina_clean\python.exe" -m meeko.cli.mk_prepare_receptor `
+  --read_pdb outputs/nav15_chainB_6LQA_clean.pdb `
+  --write_pdbqt outputs/nav15_chainB_6LQA.pdbqt `
+  --default_altloc A `
+  --box_center 128.691875 125.578875 137.582083 `
+  --box_size 24 24 24
+python scripts/batch_dock_generated_candidates.py --config configs/docking_a803467_nav18_nav15.json
+```
+
+A-803467 类似物生成会保留核心骨架，枚举芳基氯替换及甲氧基的局部改造。Nav1.5
+受体取自配体结合结构 6LQA 的链 B，脚本只保留完整标准氨基酸。其 docking box
+以 6LQA 中 quinidine 的结合坐标质心为中心；Nav1.8 使用 7WE4/A-803467 对应的
+既有 Site C box。候选及 A-803467 参考种子均在同一运行中分别对接至两个受体。
+此专用 A-803467 配置不启用示例 Nav1.8 蛋白序列评分；当前的候选变体生成是可解释的
+局部结构枚举，不是已训练的 REINVENT4 或活性预测模型。
+
+批处理通过 RDKit 写出 SDF、由 `vina_clean` 环境中的 Meeko 批量转换成 PDBQT，
+再逐个运行 Vina。每次运行创建独立时间戳目录，不覆盖候选源文件或之前结果。
+输出包含 `candidate_docking.csv`、`all_candidates.sdf`、`ligands_pdbqt/` 和两种
+受体下的 poses。不同受体/不同 pocket 的 Vina 分数只能作探索性比较，不是实验
+结合能、药效或 Nav1.8/Nav1.5 选择性证据。
+
+Nav1.8 Site C 的受体准备、A-803467 参考配体以及上述候选批量流程均已在本工作区
+实际运行验证；受体和配体准备依赖本机已安装的 `vina_clean` 环境。
 
 默认 RL 奖励只包含二维项。启用选择性后再重新生成配置；配置目录保存了当时的评分配置快照。若更换模型，建议生成新目录而非覆盖旧实验。批次多样性约束由 REINVENT4 diversity filter 承担。
 
-**已验证配置解析和真实评分子进程协议，尚未在本项目环境执行完整 REINVENT4 采样/训练**，因为项目未提供 prior 权重。Mol2Mol 的 `num_smiles` 是每个输入种子的采样数，不能直接当作总库规模。外部 CLM 的随机性由 REINVENT4 控制，本项目的 seed 不保证其 GPU 训练确定性。
+**已验证配置生成和评分子进程协议；完整 REINVENT4 采样/训练需要在本机完成环境安装后执行。** Mol2Mol 的 `num_smiles` 是每个输入种子的采样数，不能直接当作总库规模。外部 CLM 的随机性由 REINVENT4 控制，本项目的 seed 不保证其 GPU 训练确定性。
+
+本项目已在 Windows CPU 环境实际验证 REINVENT4 4.8.24：
+
+- Mol2Mol sampling 成功生成 4 个候选；
+- 项目完整评分成功输出 `outputs/reinvent_site_c_reference/sampling_scored.csv`；
+- DAP staged learning 成功运行 6 个有效步骤并生成 `rl_run_1.csv` 与 `stage1.chkpt`；
+- 该短程 RL 仅用于链路和配置验证，不代表模型已学到可靠的 Nav1.8 活性规律。
 
 ## 6. 选择性代理训练
 

@@ -18,6 +18,28 @@ except ImportError:  # pragma: no cover - fallback for minimal environments
 from .config import FilterConfig
 
 
+def _double_sigmoid(value: float, low: float, high: float) -> float:
+    if value <= low:
+        return max(0.0, min(1.0, (value - low) / max(high - low, 1e-6)))
+    if value >= high:
+        return max(0.0, min(1.0, (high - value) / max(high - low, 1e-6)))
+    return 1.0
+
+
+def reinvent_native_metrics(metrics: dict[str, float], cfg: FilterConfig) -> dict[str, float]:
+    """Mirror the REINVENT4 QED/MW/LogP component semantics locally."""
+    mw_score = _double_sigmoid(metrics["mw"], cfg.mw_min, cfg.mw_max)
+    logp_score = _double_sigmoid(metrics["logp"], cfg.clogp_min, cfg.clogp_max)
+    qed_score = max(0.0, min(1.0, metrics["qed"]))
+    geometric_mean = max(0.0, qed_score * mw_score * logp_score) ** (1.0 / 3.0)
+    return {
+        "reinvent_qed_score": float(qed_score),
+        "reinvent_mw_score": float(mw_score),
+        "reinvent_logp_score": float(logp_score),
+        "reinvent_geometric_mean": float(geometric_mean),
+    }
+
+
 def _string_heuristic_metrics(smiles: str) -> dict[str, float]:
     carbon = smiles.count("C") + smiles.count("c")
     oxygen = smiles.count("O") + smiles.count("o")
@@ -81,7 +103,13 @@ def _string_similarity(smiles_a: str, smiles_b: str) -> float:
     return len(a_set & b_set) / max(len(a_set | b_set), 1)
 
 
-def score_candidate(mol: Chem.Mol | str, seed_mol: Chem.Mol | str | None = None, cfg: FilterConfig | None = None) -> tuple[bool, dict[str, Any]]:
+def score_candidate(
+    mol: Chem.Mol | str,
+    seed_mol: Chem.Mol | str | None = None,
+    cfg: FilterConfig | None = None,
+    protein_word_metrics: dict[str, Any] | None = None,
+    site_metrics: dict[str, Any] | None = None,
+) -> tuple[bool, dict[str, Any]]:
     cfg = cfg or FilterConfig()
     metrics = descriptor_dict(mol)
     passed = True
@@ -120,6 +148,38 @@ def score_candidate(mol: Chem.Mol | str, seed_mol: Chem.Mol | str | None = None,
     metrics["reward"] = max(0.0, float(metrics["qed"]))
     membrane_score = 1.0 if cfg.clogp_min <= metrics["logp"] <= cfg.clogp_max and cfg.tpsa_min <= metrics["tpsa"] <= cfg.tpsa_max else 0.5
     metrics["reward"] = 0.7 * metrics["qed"] + 0.3 * membrane_score
+    protein_word_metrics = protein_word_metrics or {
+        "protein_word_score": 0.0,
+        "matched_rule_count": 0,
+        "matched_rules": [],
+        "protein_word_coverage": 0.0,
+    }
+    metrics.update(protein_word_metrics)
+    metrics["reward"] = (
+        (1.0 - cfg.protein_word_weight) * metrics["reward"]
+        + cfg.protein_word_weight * metrics["protein_word_score"]
+    )
+    site_metrics = site_metrics or {
+        "site_c_score": 0.0,
+        "fenestration_score": 0.0,
+        "nav18_proxy_score": 0.0,
+        "nav15_counter_penalty": 0.0,
+        "selectivity_proxy": 0.0,
+        "site_c_features": {},
+        "proxy_warning": "Site C proxy disabled",
+    }
+    metrics.update(site_metrics)
+    metrics["reward"] = (
+        (1.0 - cfg.site_c_weight - cfg.selectivity_proxy_weight) * metrics["reward"]
+        + cfg.site_c_weight * metrics["nav18_proxy_score"]
+        + cfg.selectivity_proxy_weight * metrics["selectivity_proxy"]
+    )
+    metrics.update(reinvent_native_metrics(metrics, cfg))
+    if cfg.reinvent_metric_weight:
+        metrics["reward"] = (
+            (1.0 - cfg.reinvent_metric_weight) * metrics["reward"]
+            + cfg.reinvent_metric_weight * metrics["reinvent_geometric_mean"]
+        )
     metrics["passed"] = passed
     metrics["reasons"] = reasons
     return passed, metrics

@@ -1,0 +1,2 @@
+*.pdb whitespace=-trailing-space
+*.SDF whitespace=-trailing-space

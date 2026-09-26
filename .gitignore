@@ -1,6 +1,10 @@
 .venv/
+models/
+third_party/
 __pycache__/
 .pytest_cache/
+build/
+*.egg-info/
 *.pyc
 *.pyo
 *.pyd
@@ -16,3 +20,5 @@ clean_PDB/
 *.xlsx
 *.ipynb_checkpoints/
 .DS_Store
+参考资料/
+神秘算法/

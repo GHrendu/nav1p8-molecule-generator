@@ -16,6 +16,10 @@ dependencies = [
 
 [project.scripts]
 navgen = "navgen.cli:main"
+navgen-docking = "navgen.cli_docking:main"
+
+[tool.setuptools.packages.find]
+include = ["navgen*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

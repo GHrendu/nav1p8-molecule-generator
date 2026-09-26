@@ -20,6 +20,10 @@ class FilterConfig:
     required_smarts: list[str] = field(default_factory=lambda: ["C(=O)N"])
     num_confs: int = 5
     max_candidates: int = 200
+    protein_word_weight: float = 0.2
+    site_c_weight: float = 0.0
+    selectivity_proxy_weight: float = 0.0
+    reinvent_metric_weight: float = 0.0
 
     @classmethod
     def from_mapping(cls, mapping: dict[str, Any]) -> "FilterConfig":
@@ -47,5 +51,9 @@ def load_config(path: str | Path) -> dict[str, Any]:
     cfg["filters"] = {**FilterConfig().as_dict(), **cfg.get("filters", {})}
     cfg["seed_file"] = str((config_path.parent / cfg.get("seed_file", "data/seeds.smi")).resolve())
     cfg["output_dir"] = str((config_path.parent / cfg.get("output_dir", "outputs")).resolve())
+    if cfg.get("protein_sequence_file"):
+        cfg["protein_sequence_file"] = str((config_path.parent / cfg["protein_sequence_file"]).resolve())
+    if cfg.get("site_profile_file"):
+        cfg["site_profile_file"] = str((config_path.parent / cfg["site_profile_file"]).resolve())
     cfg["filter_config"] = FilterConfig.from_mapping(cfg)
     return cfg

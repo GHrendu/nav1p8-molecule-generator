@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import random
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 try:
     from rdkit import Chem
@@ -75,6 +75,11 @@ def build_replacement_candidates(seed_smiles: str, blocks: Iterable[str] | None 
     else:
         mol = seed
 
+    if Chem is not None:
+        analogs = _build_seed_analogs(seed, mol, max_candidates)
+        if analogs:
+            return analogs
+
     block_list = list(blocks or DEFAULT_BLOCKS)
     random.Random(0).shuffle(block_list)
     block_list = block_list[:max_candidates]
@@ -117,6 +122,133 @@ def build_replacement_candidates(seed_smiles: str, blocks: Iterable[str] | None 
             }
         )
     return records
+
+
+def _build_seed_analogs(seed: str, seed_mol: Chem.Mol, max_candidates: int) -> list[dict]:
+    mutations: list[tuple[str, Callable[[Chem.RWMol], None]]] = []
+    for atom in seed_mol.GetAtoms():
+        if atom.GetSymbol() == "Cl" and atom.GetDegree() == 1:
+            neighbor = atom.GetNeighbors()[0]
+            if neighbor.GetIsAromatic():
+                atom_idx = atom.GetIdx()
+                for symbol, atomic_num in (("F", 9), ("Br", 35), ("I", 53)):
+                    mutations.append(
+                        (
+                            f"aryl_Cl_to_{symbol}",
+                            lambda rw_mol, idx=atom_idx, number=atomic_num: rw_mol.GetAtomWithIdx(idx).SetAtomicNum(number),
+                        )
+                    )
+                mutations.append(
+                    (
+                        "aryl_Cl_to_H",
+                        lambda rw_mol, idx=atom_idx: rw_mol.RemoveAtom(idx),
+                    )
+                )
+                mutations.append(
+                    (
+                        "aryl_Cl_to_CF3",
+                        lambda rw_mol, idx=atom_idx: _replace_chlorine_with_cf3(rw_mol, idx),
+                    )
+                )
+
+    methoxy = Chem.MolFromSmarts("[OX2][CH3]")
+    for match in seed_mol.GetSubstructMatches(methoxy):
+        oxygen_idx, methyl_idx = match
+        if not any(neighbor.GetIsAromatic() for neighbor in seed_mol.GetAtomWithIdx(oxygen_idx).GetNeighbors()):
+            continue
+        mutations.extend(
+            [
+                (
+                    f"methoxy_to_ethoxy_at_{oxygen_idx}",
+                    lambda rw_mol, idx=methyl_idx: _extend_methyl_to_ethyl(rw_mol, idx),
+                ),
+                (
+                    f"methoxy_to_hydroxy_at_{oxygen_idx}",
+                    lambda rw_mol, idx=methyl_idx: rw_mol.RemoveAtom(idx),
+                ),
+                (
+                    f"methoxy_to_H_at_{oxygen_idx}",
+                    lambda rw_mol, oxygen=oxygen_idx, methyl=methyl_idx: _remove_methoxy(
+                        rw_mol, oxygen, methyl
+                    ),
+                ),
+            ]
+        )
+
+    candidates: list[dict] = []
+    seen_smiles = {seed}
+
+    def add_mutant(
+        mutation_names: list[str],
+        actions: list[Callable[[Chem.RWMol], None]],
+    ) -> None:
+        editable = Chem.RWMol(seed_mol)
+        try:
+            for action in actions:
+                action(editable)
+            mutant = editable.GetMol()
+            Chem.SanitizeMol(mutant)
+            smiles = Chem.MolToSmiles(mutant, canonical=True)
+        except (RuntimeError, ValueError):
+            return
+        if smiles in seen_smiles:
+            return
+        seen_smiles.add(smiles)
+        candidates.append(
+            {
+                "candidate_id": candidate_id(smiles),
+                "seed": seed,
+                "source": "seed_analogue",
+                "route": "+".join(mutation_names),
+                "reaction_smarts": "",
+                "reactants": [seed],
+                "block": "",
+                "canonical_smiles": smiles,
+                "rank": len(candidates),
+            }
+        )
+
+    for name, mutation in mutations:
+        add_mutant([name], [mutation])
+        if len(candidates) >= max_candidates:
+            return candidates[:max_candidates]
+
+    non_deletion_mutations = [
+        (name, mutation)
+        for name, mutation in mutations
+        if (name.startswith("aryl_Cl_to_") and name != "aryl_Cl_to_H")
+        or name.startswith("methoxy_to_ethoxy")
+    ]
+    for first_idx, (first_name, first_mutation) in enumerate(non_deletion_mutations):
+        for second_name, second_mutation in non_deletion_mutations[first_idx + 1 :]:
+            if first_name.startswith("aryl_Cl") == second_name.startswith("aryl_Cl"):
+                continue
+            add_mutant(
+                [first_name, second_name],
+                [first_mutation, second_mutation],
+            )
+            if len(candidates) >= max_candidates:
+                return candidates[:max_candidates]
+    return candidates[:max_candidates]
+
+
+def _replace_chlorine_with_cf3(mol: Chem.RWMol, atom_idx: int) -> None:
+    carbon = mol.GetAtomWithIdx(atom_idx)
+    carbon.SetAtomicNum(6)
+    carbon.SetIsAromatic(False)
+    for _ in range(3):
+        fluorine_idx = mol.AddAtom(Chem.Atom(9))
+        mol.AddBond(atom_idx, fluorine_idx, Chem.BondType.SINGLE)
+
+
+def _extend_methyl_to_ethyl(mol: Chem.RWMol, methyl_idx: int) -> None:
+    carbon_idx = mol.AddAtom(Chem.Atom(6))
+    mol.AddBond(methyl_idx, carbon_idx, Chem.BondType.SINGLE)
+
+
+def _remove_methoxy(mol: Chem.RWMol, oxygen_idx: int, methyl_idx: int) -> None:
+    for atom_idx in sorted((oxygen_idx, methyl_idx), reverse=True):
+        mol.RemoveAtom(atom_idx)
 
 
 def generate_candidates_for_seed(seed_smiles: str, max_candidates: int = 30) -> list[dict]:
